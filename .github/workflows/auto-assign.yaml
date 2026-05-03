@@ -1,0 +1,77 @@
+name: Auto Assign Reviewers
+
+on:
+  pull_request:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  auto-assign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Auto assign reviewers
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "OWNERS" ]; then
+            echo "OWNERS file not found, skipping auto-assignment"
+            exit 0
+          fi
+
+          in_auto_assign=false
+          all_reviewers=""
+
+          normalize_reviewer() {
+            echo "$1" | sed -E 's/^[[:space:]]*@?//; s/[[:space:]]*$//'
+          }
+
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+            if [[ "$line" =~ ^auto-assign: ]]; then
+              in_auto_assign=true
+              continue
+            fi
+
+            if $in_auto_assign && [[ "$line" =~ ^[^[:space:]] ]]; then
+              in_auto_assign=false
+            fi
+            $in_auto_assign || continue
+
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*([^:]+)$ ]]; then
+              reviewer=$(normalize_reviewer "$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]*//')")
+              echo "Found reviewer: $reviewer"
+              all_reviewers+="$reviewer"$'\n'
+            fi
+          done < OWNERS
+
+          mapfile -t reviewers < <(printf "%s" "$all_reviewers" | sed '/^$/d' | sort -u | grep -v -x "$PR_AUTHOR" | shuf -n 2 || true)
+
+          if [ "${#reviewers[@]}" -eq 0 ]; then
+            echo "No reviewers found for auto-assignment"
+            exit 0
+          fi
+
+          echo "Assigning ${#reviewers[@]} reviewer(s): ${reviewers[*]}"
+
+          payload=$(printf '%s\n' "${reviewers[@]}" | jq -R -s -c 'split("\n") | map(select(length>0))')
+
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" \
+            -d "{\"reviewers\": $payload}" \
+            | jq -r '.message? // "ok"'
