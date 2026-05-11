@@ -34,7 +34,7 @@ export MODEL_FAMILY="${MODEL_NAME%%/*}"
 export MODEL_ID="${MODEL_NAME##*/}"
 export MODEL_NAME_SAFE=$(echo "${MODEL_ID}" | tr '[:upper:]' '[:lower:]' | tr ' /_.' '-')
 
-# TBD: DISAGG_P=true is currently the only supported value; false is not implemented.
+# Placeholder: DISAGG_P=true is currently the only supported value; false is not implemented.
 export DISAGG_P=true
 
 # Dual pool names for P/D disaggregation
