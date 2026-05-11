@@ -1,0 +1,146 @@
+# Development
+
+Documentation for running the coordinator's P/D dev environment locally on a Kind cluster.
+
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Kind Development Environment](#kind-development-environment)
+  - [Accessing the Gateway](#accessing-the-gateway)
+  - [Testing the Prefill and Decode Paths](#testing-the-prefill-and-decode-paths)
+  - [Cleanup](#cleanup)
+- [Disaggregation Modes](#disaggregation-modes)
+- [Image Tags and Overrides](#image-tags-and-overrides)
+
+## Requirements
+
+- [Make] `v4`+
+- [Docker] (or [Podman])
+- [Kubernetes in Docker (KIND)]
+- [Kubectl] `v1.25`+
+
+[Make]: https://www.gnu.org/software/make/
+[Docker]: https://www.docker.com/
+[Podman]: https://podman.io/
+[Kubernetes in Docker (KIND)]: https://github.com/kubernetes-sigs/kind
+[Kubectl]: https://kubectl.docs.kubernetes.io/installation/kubectl/
+
+## Kind Development Environment
+
+```bash
+make env-dev-kind
+```
+
+Deploys a local Prefill/Decode (P/D) inference stack to the `llm-d-coordinator-dev` Kind cluster. This script bootstraps all prerequisites (Gateway API, GIE, Istio CRDs, and the Istio control plane) in the default namespace. It then provisions two distinct inference pipelines:
+
+- `/prefill/...` → prefill InferencePool → EPP-P → vllm-p pods
+- `/decode/...`  → decode InferencePool  → EPP-D → vllm-d pods
+
+
+> [!NOTE]
+> Pre-pull external images to avoid slow downloads during deploy:
+> ```
+> docker pull ghcr.io/llm-d/llm-d-inference-sim:v0.8.2
+> docker pull ghcr.io/llm-d/llm-d-inference-scheduler:latest
+> docker pull ghcr.io/llm-d/llm-d-routing-sidecar:latest
+> docker pull ghcr.io/llm-d/llm-d-uds-tokenizer:latest
+> ```
+
+### Accessing the Gateway
+
+The Gateway is exposed on your development machine at `http://localhost:30080` via a
+NodePort baked into the Kind cluster at creation time. Override the host port with:
+
+```bash
+KIND_GATEWAY_HOST_PORT=31080 make env-dev-kind
+```
+
+> [!NOTE]
+> `KIND_GATEWAY_HOST_PORT` is baked in at cluster creation. To change it after the
+> cluster exists, run `make clean-env-dev-kind` first, then recreate.
+
+Alternatively, port-forward the Istio gateway service:
+
+```bash
+kubectl --context kind-llm-d-coordinator-dev \
+  port-forward service/inference-gateway-istio 8080:80
+```
+
+Then requests go to `http://localhost:8080`.
+
+### Testing the Prefill and Decode Paths
+
+The Gateway routes by path prefix — each path hits its own pool:
+
+```bash
+# Test prefill path
+curl -s http://localhost:30080/prefill/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"hi","max_tokens":5}' | jq
+
+# Test decode path
+curl -s http://localhost:30080/decode/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"hi","max_tokens":5}' | jq
+```
+
+The URLRewrite filter strips the `/prefill` or `/decode` prefix before forwarding to
+the vLLM pods, so each pool sees the standard `/v1/completions` path.
+
+Inspect cluster state:
+
+```bash
+kubectl get inferencepools
+kubectl get pods -l llm-d.ai/component=prefill
+kubectl get pods -l llm-d.ai/component=decode
+kubectl logs -l app=$(echo $MODEL_NAME_SAFE)-prefill-endpoint-picker -c epp
+kubectl logs -l app=$(echo $MODEL_NAME_SAFE)-decode-endpoint-picker  -c epp
+```
+
+### Cleanup
+
+```bash
+make clean-env-dev-kind
+```
+
+Deletes the Kind cluster entirely.
+
+## Disaggregation Modes
+
+For API compatibility with `llm-d-inference-scheduler`, the script accepts `DISAGG_E`
+and `DISAGG_P` flags, but only one combination is currently supported:
+
+| `DISAGG_E` | `DISAGG_P` | Status |
+|---|---|---|
+| `false` | `true` | ✅ Supported (default) — P/D |
+| `false` | `false` | ❌ Error — always P/D here |
+| `true`  | any    | ❌ Error — encode-disaggregation not implemented in this repo |
+
+Use `llm-d-inference-scheduler` if you need the no-disagg, E/PD, or E/P/D scenarios.
+
+## Image Tags and Overrides
+
+Image tags and registry live in [versions.mk](versions.mk), which the Makefile includes
+and exports to `scripts/kind-dev-env.sh`:
+
+| Variable | Image | Default |
+|---|---|---|
+| `VLLM_IMAGE` / `VLLM_SIMULATOR_TAG` | `llm-d-inference-sim` | `v0.8.2` |
+| `EPP_IMAGE` / `EPP_TAG` | `llm-d-inference-scheduler` | `dev` (llm-d fork — registers `llm-d.ai/v1alpha1`) |
+| `SIDECAR_IMAGE` / `SIDECAR_TAG` | `llm-d-routing-sidecar` | `v0.8.0` |
+| `UDS_TOKENIZER_IMAGE` / `UDS_TOKENIZER_TAG` | `llm-d-uds-tokenizer` | `v0.8.0` |
+| `IMAGE_REGISTRY` | — | `ghcr.io/llm-d` |
+| `MODEL_NAME` | vLLM model (in script) | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` |
+| `VLLM_REPLICA_COUNT_P` / `VLLM_REPLICA_COUNT_D` | replica counts (in script) | `1` / `1` |
+| `VLLM_DATA_PARALLEL_SIZE` | data-parallel ranks per vLLM pod (in script) | `1` |
+
+Override any image via the command line — Make's `?=` assignments yield to existing env
+or command-line values:
+
+```bash
+EPP_TAG=foo make env-dev-kind
+# or permanently by editing versions.mk
+```
+
+To run `scripts/kind-dev-env.sh` without `make`, source `versions.mk`'s values into your
+shell first — the script `:?`-errors if any image var is unset.
